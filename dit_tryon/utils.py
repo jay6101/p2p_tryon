@@ -15,7 +15,7 @@ def plot_batch(tensor, batch_data, plot_shape, filename, img_size=(32,32)):
     tensor_np = np.clip(tensor_np, 0, 255).astype(np.uint8)
     rows = plot_shape[0]
     #columns = plot_shape[1]
-    columns = 2
+    columns = 4
     # Proportional scale by img size
     scale = (img_size[0] / 90) 
     fig, axes = plt.subplots(rows, columns, figsize=(columns * scale, rows * scale))
@@ -26,6 +26,8 @@ def plot_batch(tensor, batch_data, plot_shape, filename, img_size=(32,32)):
             # Calculate the index of the image
             img_idx = i
             target_img = batch_data['target_image'][img_idx]
+            garment_img = batch_data['garment'][img_idx]
+            cloth_agnostic_mask = batch_data['cloth_agnostic'][img_idx]
             # If the image index exceeds the number of images, stop plotting
             if img_idx >= tensor_np.shape[0]:
                 break
@@ -36,6 +38,14 @@ def plot_batch(tensor, batch_data, plot_shape, filename, img_size=(32,32)):
                 target_img = deprocess(target_img.permute(1, 2, 0))
                 target_img = np.clip(target_img.numpy(), 0, 255).astype(np.uint8)
                 ax.imshow(target_img)
+            elif j == 1:
+                cloth_agnostic_mask = deprocess(cloth_agnostic_mask.permute(1, 2, 0))
+                cloth_agnostic_mask = np.clip(cloth_agnostic_mask.numpy(), 0, 255).astype(np.uint8)
+                ax.imshow(cloth_agnostic_mask)
+            elif j == 2:
+                garment_img = deprocess(garment_img.permute(1, 2, 0))
+                garment_img = np.clip(garment_img.numpy(), 0, 255).astype(np.uint8)
+                ax.imshow(garment_img)
             else:
                 ax.imshow(tensor_np[img_idx])
             ax.axis('off')
