@@ -1,0 +1,8 @@
+FID Evaluation Results
+======================
+Inference results dir: /space/mcdonald-syn01/1/projects/jsawant/ECE285/dit_tryon_6/inference_results_fid
+Real data dir: /space/mcdonald-syn01/1/projects/jsawant/ECE285/data/custom_train_data
+Number of synthesized images: 1983
+Number of real images: 1983
+Image size: 512x512
+FID Score: 27.7574

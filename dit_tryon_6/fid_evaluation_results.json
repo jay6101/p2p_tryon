@@ -1,0 +1,8 @@
+{
+    "inference_results_dir": "/space/mcdonald-syn01/1/projects/jsawant/ECE285/dit_tryon_6/inference_results_fid",
+    "real_data_dir": "/space/mcdonald-syn01/1/projects/jsawant/ECE285/data/custom_train_data",
+    "num_synthesized_images": 1983,
+    "num_real_images": 1983,
+    "img_size": 512,
+    "fid_score": 27.757409918964527
+}

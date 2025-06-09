@@ -1,0 +1,339 @@
+'''DiT Linformer model for Pytorch.
+
+Author: Emilio Morales (mil.mor.mor@gmail.com)
+        Dec 2023
+Modified for Virtual Try-on with multiple conditions
+'''
+import torch
+import torch.nn as nn
+import math
+from timm.models.vision_transformer import Attention
+
+
+class PositionalEmbedding(nn.Module):
+    def __init__(self, dim, scale=1.0):
+        super().__init__()
+        assert dim % 2 == 0
+        self.dim = dim
+        self.scale = scale
+
+    def forward(self, x):
+        device = x.device
+        half_dim = self.dim // 2
+        emb = math.log(10000) / half_dim
+        emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
+        emb = torch.outer(x * self.scale, emb)
+        emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
+        return emb
+
+
+def modulate(x, shift, scale):
+    return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+
+class CrossAttention(nn.Module):
+    def __init__(self, dim, heads):
+        super().__init__()
+        self.num_heads = heads
+        self.scale = (dim // heads) ** -0.5
+        
+        self.to_q = nn.Linear(dim, dim, bias=True)
+        self.to_k = nn.Linear(dim, dim, bias=True)
+        self.to_v = nn.Linear(dim, dim, bias=True)
+        self.to_out = nn.Linear(dim, dim)
+        
+    def forward(self, x, context):
+        b, n, d = x.shape
+        h = self.num_heads
+        
+        q = self.to_q(x).reshape(b, n, h, d // h).permute(0, 2, 1, 3)
+        k = self.to_k(context).reshape(b, -1, h, d // h).permute(0, 2, 1, 3)
+        v = self.to_v(context).reshape(b, -1, h, d // h).permute(0, 2, 1, 3)
+        
+        attn = torch.matmul(q, k.transpose(-1, -2)) * self.scale
+        attn = attn.softmax(dim=-1)
+        
+        out = torch.matmul(attn, v)
+        out = out.permute(0, 2, 1, 3).reshape(b, n, d)
+        return self.to_out(out)
+    
+
+class TransformerBlock(nn.Module):
+    def __init__(self, seq_len, dim, heads, mlp_dim, k, rate=0.1, is_first=False):
+        super().__init__()
+        self.ln_1 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.attn = Attention(dim, num_heads=heads, qkv_bias=True)
+        self.ln_cross = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.cross_attn = CrossAttention(dim, heads)
+        self.ln_2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, mlp_dim),
+            nn.GELU(),
+            nn.Dropout(rate),
+            nn.Linear(mlp_dim, dim),
+            nn.Dropout(rate),
+        )
+        # Modulation parameters
+        self.gamma_1 = nn.Linear(dim, dim)
+        self.beta_1 = nn.Linear(dim, dim)
+        self.gamma_cross = nn.Linear(dim, dim)
+        self.beta_cross = nn.Linear(dim, dim)
+        self.gamma_2 = nn.Linear(dim, dim)
+        self.beta_2 = nn.Linear(dim, dim)
+        self.scale_1 = nn.Linear(dim, dim)
+        self.scale_cross = nn.Linear(dim, dim)
+        self.scale_2 = nn.Linear(dim, dim)
+        
+        self.is_first = is_first
+
+        # Initialize weights to zero for modulation and gating layers
+        self._init_weights([self.gamma_1, self.beta_1, self.gamma_cross, self.beta_cross,
+                          self.gamma_2, self.beta_2, self.scale_1, self.scale_cross, self.scale_2])
+
+    def _init_weights(self, layers):
+        for layer in [self.scale_1, self.scale_cross, self.scale_2]:
+            nn.init.zeros_(layer.weight)
+            nn.init.ones_(layer.bias)
+
+        # γ / β layers: want neutral
+        for layer in [self.gamma_1, self.beta_1,
+                    self.gamma_cross, self.beta_cross,
+                    self.gamma_2, self.beta_2]:
+            nn.init.zeros_(layer.weight)
+            nn.init.zeros_(layer.bias)
+
+    def forward(self, x, c, cloth_agnostic_tokens, garment_tokens):
+        # if self.is_first:
+        combined_tokens = torch.cat([x, cloth_agnostic_tokens], dim=1)
+        # else:
+        #     combined_tokens = x
+        
+        # Self-attention modulation
+        scale_msa = self.gamma_1(c)
+        shift_msa = self.beta_1(c)
+        gate_msa = self.scale_1(c).unsqueeze(1)
+        
+        # Apply self-attention
+        attn_output = self.attn(modulate(self.ln_1(combined_tokens), shift_msa, scale_msa))
+        
+        # Extract only the output corresponding to the noisy tokens
+        attn_output = attn_output[:, :x.size(1)]
+        x = attn_output * gate_msa + x
+        
+        # Cross-attention modulation
+        scale_cross = self.gamma_cross(c)
+        shift_cross = self.beta_cross(c)
+        gate_cross = self.scale_cross(c).unsqueeze(1)
+        
+        # Apply cross-attention
+        cross_output = self.cross_attn(
+            modulate(self.ln_cross(x), shift_cross, scale_cross),
+            garment_tokens
+        )
+        x = cross_output * gate_cross + x
+        
+        # MLP modulation
+        scale_mlp = self.gamma_2(c)
+        shift_mlp = self.beta_2(c)
+        gate_mlp = self.scale_2(c).unsqueeze(1)
+        
+        # Apply MLP
+        mlp_output = self.mlp(modulate(self.ln_2(x), shift_mlp, scale_mlp))
+        return mlp_output * gate_mlp + x
+
+class FinalLayer(nn.Module):
+    def __init__(self, dim, patch_size, out_channels):
+        super().__init__()
+        self.ln_final = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.linear = nn.Linear(dim, patch_size * patch_size * out_channels, bias=True)
+        self.gamma = nn.Linear(dim, dim)
+        self.beta = nn.Linear(dim, dim)
+
+        # Initialize weights and biases to zero for modulation and linear layers
+        self._init_weights([self.linear, self.gamma, self.beta])
+
+    def _init_weights(self, layers):
+        for layer in layers:
+            nn.init.zeros_(layer.bias)             # keep biases at 0
+            nn.init.kaiming_uniform_(layer.weight, a=math.sqrt(5))        
+
+    def forward(self, x, c):
+        scale = self.gamma(c)
+        shift = self.beta(c)
+        x = modulate(self.ln_final(x), shift, scale)
+        x = self.linear(x)
+        return x
+
+class DiT(nn.Module):
+    def __init__(self, img_size, dim=64, patch_size=4,
+                 depth=3, heads=4, mlp_dim=512, k=64, in_channels=3, rate=0.1):
+        super(DiT, self).__init__()
+        self.dim = dim
+        self.n_patches = (img_size[0] // patch_size)*(img_size[1] // patch_size)
+        self.depth = depth
+        self.pos_embedding = nn.Parameter(
+            torch.randn(1, self.n_patches, dim))
+        
+        # Tokenizer for all images (noisy, cloth agnostic, garment)
+        self.noisy_patches = nn.Sequential(
+            nn.Conv2d(in_channels, dim, kernel_size=patch_size, 
+                      stride=patch_size, padding=0, bias=False),
+        )
+        self.cloth_agnostic_patches = nn.Sequential(
+            nn.Conv2d(in_channels+3, dim, kernel_size=patch_size, 
+                      stride=patch_size, padding=0, bias=False),
+        )
+        self.garment_patches = nn.Sequential(
+            nn.Conv2d(in_channels+3, dim, kernel_size=patch_size, 
+                      stride=patch_size, padding=0, bias=False),
+        )
+        
+        self.transformer = nn.ModuleList()
+        for i in range(self.depth):
+            if i == 0:
+                self.transformer.append(
+                    TransformerBlock(
+                        self.n_patches, dim, heads, mlp_dim, k, is_first=True
+                    )
+                )
+            else:
+                self.transformer.append(
+                    TransformerBlock(
+                        self.n_patches, dim, heads, mlp_dim, k, is_first=False
+                    )
+                )
+
+        self.emb = nn.Sequential(
+            PositionalEmbedding(dim),
+            nn.Linear(dim, dim),
+            nn.SiLU(),
+            nn.Linear(dim, dim),
+        )
+
+        self.final = FinalLayer(dim, patch_size, in_channels)
+        self.ps = nn.PixelShuffle(patch_size)
+        self.refine = nn.Sequential(
+                nn.Conv2d(3, 64, 3, padding=1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(64, 3, 3, padding=1))
+        self.embedding_table = nn.Embedding(num_embeddings=3, embedding_dim=dim)
+
+    def forward(self, x, t, cloth_agnostic, garment):
+        t = self.emb(t)
+        
+        # Tokenize all images
+        x_tokens = self.noisy_patches(x)
+        cloth_agnostic_tokens = self.cloth_agnostic_patches(cloth_agnostic)
+        garment_tokens = self.garment_patches(garment)
+        
+        # Reshape tokens
+        B, C, H, W = x_tokens.shape
+        x_tokens = x_tokens.permute([0, 2, 3, 1]).reshape([B, H * W, C])
+        cloth_agnostic_tokens = cloth_agnostic_tokens.permute([0, 2, 3, 1]).reshape([B, H * W, C])
+        garment_tokens = garment_tokens.permute([0, 2, 3, 1]).reshape([B, H * W, C])
+        
+        t0 = torch.zeros((B, H*W), dtype=torch.long, device=x_tokens.device)       # noisy tokens
+        t1 = torch.ones((B, H*W), dtype=torch.long, device=x_tokens.device)        # cloth-agnostic
+        t2 = torch.full((B, H*W), 2, dtype=torch.long, device=x_tokens.device)     # garment
+        
+        # Add positional embedding to noisy tokens
+        x_tokens = x_tokens + self.pos_embedding + self.embedding_table(t0)
+        cloth_agnostic_tokens = cloth_agnostic_tokens + self.pos_embedding + self.embedding_table(t1)
+        garment_tokens = garment_tokens + self.pos_embedding + self.embedding_table(t2)
+        
+        # Apply transformer blocks
+        for layer in self.transformer:
+            x_tokens = layer(x_tokens, t, cloth_agnostic_tokens, garment_tokens)
+            
+        #x_tokens = x_tokens[:, :x_tokens.size(1)//3]
+
+        # Final layer
+        x = self.final(x_tokens, t).permute([0, 2, 1])
+        x = x.reshape([B, -1, H, W])
+        x = self.ps(x)
+        #x = x+self.refine(x)
+        return x
+        
+    def forward_with_cfg(self, x, t, cloth_agnostic, garment, guidance_scale):
+        """
+        Forward pass with classifier-free guidance.
+        
+        Args:
+            x: Noisy input image
+            t: Timestep
+            cloth_agnostic: Person representation without clothes
+            garment: Garment to try on
+            guidance_scale: Scale factor for classifier-free guidance (1.0 means no guidance)
+            
+        Returns:
+            Predicted denoised image with guidance applied
+        """
+        # If guidance scale is 1.0, equivalent to standard forward pass
+        if guidance_scale == 1.0:
+            return self.forward(x, t, cloth_agnostic, garment)
+        
+        # Batch size
+        half_batch_size = x.shape[0]
+        
+        # Create a "null" conditioning by averaging the cloth_agnostic and garment across batch
+        # Or use zeros (we choose zeros here as a simpler approach)
+        B, C, H, W = cloth_agnostic.shape
+        null_cloth_agnostic = torch.zeros_like(cloth_agnostic)
+        null_garment = torch.zeros_like(garment)
+        
+        # Concatenate the real and null conditioning
+        x_doubled = torch.cat([x, x], dim=0)
+        t_doubled = torch.cat([t, t], dim=0)
+        cloth_agnostic_doubled = torch.cat([cloth_agnostic, null_cloth_agnostic], dim=0)
+        garment_doubled = torch.cat([garment, null_garment], dim=0)
+        
+        # Get predictions for both conditioned and unconditioned
+        predictions = self.forward(x_doubled, t_doubled, cloth_agnostic_doubled, garment_doubled)
+        
+        # Split the predictions
+        pred_conditioned, pred_unconditioned = torch.split(predictions, half_batch_size, dim=0)
+        
+        # Apply classifier-free guidance
+        return pred_unconditioned + guidance_scale * (pred_conditioned - pred_unconditioned)
+
+
+
+# class LinformerAttention(nn.Module):
+#     def __init__(self, seq_len, dim, n_heads, k, bias=True):
+#         super().__init__()
+#         self.n_heads = n_heads
+#         self.scale = (dim // n_heads) ** -0.5
+#         self.qw = nn.Linear(dim, dim, bias = bias)
+#         self.kw = nn.Linear(dim, dim, bias = bias)
+#         self.vw = nn.Linear(dim, dim, bias = bias)
+
+#         self.E = nn.Parameter(torch.randn(seq_len, k))
+#         self.F = nn.Parameter(torch.randn(seq_len, k))
+
+#         self.ow = nn.Linear(dim, dim, bias = bias)
+
+#     def forward(self, x):
+#         q = self.qw(x)
+#         k = self.kw(x)
+#         v = self.vw(x)
+
+#         B, L, D = q.shape
+#         q = torch.reshape(q, [B, L, self.n_heads, -1])
+#         q = torch.permute(q, [0, 2, 1, 3])
+#         k = torch.reshape(k, [B, L, self.n_heads, -1])
+#         k = torch.permute(k, [0, 2, 3, 1])
+#         v = torch.reshape(v, [B, L, self.n_heads, -1])
+#         v = torch.permute(v, [0, 2, 3, 1])
+#         k = torch.matmul(k, self.E[:L, :])
+
+#         v = torch.matmul(v, self.F[:L, :])
+#         v = torch.permute(v, [0, 1, 3, 2])
+
+#         qk = torch.matmul(q, k) * self.scale
+#         attn = torch.softmax(qk, dim=-1)
+
+#         v_attn = torch.matmul(attn, v)
+#         v_attn = torch.permute(v_attn, [0, 2, 1, 3])
+#         v_attn = torch.reshape(v_attn, [B, L, D])
+
+#         x = self.ow(v_attn)
+#         return x
